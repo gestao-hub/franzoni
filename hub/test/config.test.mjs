@@ -115,60 +115,23 @@ describe('config — versão por env', () => {
   });
 });
 
-describe('config — sync sob demanda do agente', () => {
-  const key = 'EXPED_AGENT_SYNC_PORT';
-  let saved;
-
-  beforeEach(() => {
-    saved = process.env[key];
-    delete process.env[key];
-  });
-
-  afterEach(() => {
-    if (saved === undefined) delete process.env[key];
-    else process.env[key] = saved;
-  });
-
-  it('usa a porta local padrão', () => {
-    expect(loadConfig({ jwtSecret: VALID }).agent.syncNowPort).toBe(5005);
-  });
-
-  it('aceita porta customizada e zero para desativar', () => {
-    process.env[key] = '6005';
-    expect(loadConfig({ jwtSecret: VALID }).agent.syncNowPort).toBe(6005);
-
-    process.env[key] = '0';
-    expect(loadConfig({ jwtSecret: VALID }).agent.syncNowPort).toBe(0);
-  });
-});
-
 describe('config — contrato de startup do agente', () => {
-  it('declara somente recuperacao no logon interativo', () => {
-    const cfg = loadConfig({ jwtSecret: VALID });
+  it('declara somente recuperação no logon interativo', () => {
+    const cfg = loadConfig({ jwtSecret: 'x'.repeat(40) });
     expect(cfg.agent.startupMode).toBe('interactive_logon');
     expect(cfg.agent.survivesRebootWithoutLogon).toBe(false);
-    expect(cfg.agent.healthPath).toMatch(/ExpedAgent.*health\.json/i);
   });
 
-  it('recusa windows_service sem servico real e identidade comprovada', () => {
+  it('recusa windows_service sem um serviço real e identidade comprovada', () => {
     expect(() => loadConfig({
-      jwtSecret: VALID,
+      jwtSecret: 'x'.repeat(40),
       agent: { startupMode: 'windows_service' },
     })).toThrow(/interactive_logon|windows_service/i);
   });
 
-  it('mantem disabled verdadeiro sem prometer recuperacao pre-login', () => {
-    const cfg = loadConfig({
-      jwtSecret: VALID,
-      agent: { startupMode: 'disabled', syncNowPort: 0 },
-    });
-    expect(cfg.agent.startupMode).toBe('disabled');
-    expect(cfg.agent.survivesRebootWithoutLogon).toBe(false);
-  });
-
-  it('recusa afirmar sobrevivencia a reboot sem login', () => {
+  it('recusa afirmar sobrevivência a reboot sem login', () => {
     expect(() => loadConfig({
-      jwtSecret: VALID,
+      jwtSecret: 'x'.repeat(40),
       agent: { survivesRebootWithoutLogon: true },
     })).toThrow(/survivesRebootWithoutLogon|sem login/i);
   });

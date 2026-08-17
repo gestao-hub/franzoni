@@ -47,7 +47,6 @@ if ($transactionModeCount -eq 0) {
 if ($InstallerTransactionId -notmatch '^[A-Za-z0-9_-]{16,80}$') {
   throw 'InstallerTransactionId invalido.'
 }
-
 . (Join-Path $PSScriptRoot 'agent-settings.ps1')
 
 $logDir = Join-Path $Root 'logs'
@@ -554,13 +553,10 @@ try {
     $config.agent | Add-Member -NotePropertyName syncNowPort -NotePropertyValue 5005 -Force
   }
   $null = Get-ExpedAgentSyncNowPort $config
-  if (-not $config.cloud) {
-    $config | Add-Member -NotePropertyName cloud -NotePropertyValue ([pscustomobject]@{}) -Force
-  }
-  $config.cloud | Add-Member -NotePropertyName apiBase `
-    -NotePropertyValue "$($recovery.CloudApi)" -Force
-  $config.cloud | Add-Member -NotePropertyName deviceToken `
-    -NotePropertyValue "$($recovery.DeviceToken)" -Force
+  $config | Add-Member -NotePropertyName cloud -NotePropertyValue ([pscustomobject]@{
+    apiBase = "$($recovery.CloudApi)"
+    deviceToken = "$($recovery.DeviceToken)"
+  }) -Force
   Write-ExpedJsonAtomically $configPath $config
   Write-ProvisionJournalState $state 'ConfigsWritten'
   Log 'config.json foi atualizado atomicamente; Agent permanece deferido ao usuario original.'

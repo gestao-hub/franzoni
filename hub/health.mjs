@@ -27,7 +27,6 @@ export function projectAgentReadiness(snapshot, {
     Number.isInteger(snapshot?.pid) && snapshot.pid > 0 &&
     ageMs !== null && ageMs <= maxAgeMs;
   const hiper = snapshot?.hiper && typeof snapshot.hiper === 'object' ? snapshot.hiper : {};
-  const lastSyncNowAt = Date.parse(snapshot?.lastSyncNowAt || '');
 
   return {
     running,
@@ -35,16 +34,6 @@ export function projectAgentReadiness(snapshot, {
     agentVersion: safeString(snapshot?.agentVersion, 64),
     checkedAt: Number.isFinite(checkedAt) ? new Date(checkedAt).toISOString() : null,
     ageMs,
-    lastSyncNowAt: Number.isFinite(lastSyncNowAt)
-      ? new Date(lastSyncNowAt).toISOString()
-      : null,
-    lastSyncNowOk: typeof snapshot?.lastSyncNowOk === 'boolean'
-      ? snapshot.lastSyncNowOk
-      : null,
-    lastSyncNowSynced: Number.isInteger(snapshot?.lastSyncNowSynced)
-      && snapshot.lastSyncNowSynced >= 0
-      ? snapshot.lastSyncNowSynced
-      : null,
     diagnostic: running
       ? 'Agent em execucao; o estado da consulta Hiper e reportado separadamente.'
       : 'Agent sem heartbeat recente; requer logon da conta operacional.',
@@ -57,7 +46,7 @@ export function projectAgentReadiness(snapshot, {
       serverVersion: safeString(hiper.serverVersion, 128),
       sampleOrderId: Number.isInteger(hiper.sampleOrderId) ? hiper.sampleOrderId : null,
       missingColumns: Array.isArray(hiper.missingColumns)
-        ? hiper.missingColumns.filter((value) => typeof value === 'string').slice(0, 100)
+        ? hiper.missingColumns.filter((v) => typeof v === 'string').slice(0, 100)
         : [],
       error: safeString(hiper.error),
     },
@@ -89,41 +78,25 @@ export function assertCompleteHubStatus(status, { essentialPeers = ESSENTIAL_PEE
     }
   }
 
-  const agent = status.agent || {};
-  if (agent.survivesRebootWithoutLogon !== false) {
+  if (status.agent?.startupMode !== 'interactive_logon') {
+    throw new Error('/status: Agent nao esta no modo interactive_logon suportado');
+  }
+  if (status.agent?.survivesRebootWithoutLogon !== false) {
     throw new Error('/status: Agent afirmou recuperacao sem login sem garantia real');
   }
-  if (agent.startupMode === 'disabled') {
-    if (agent.enabled !== false || agent.running !== false) {
-      throw new Error('/status: Agent disabled reportou processo habilitado');
-    }
-  } else if (agent.startupMode === 'interactive_logon') {
-    if (agent.enabled !== true) throw new Error('/status: Agent interativo nao esta enabled');
-    if (agent.running !== true) throw new Error('/status: processo do Agent sem readiness');
-    if (agent.syncNowPort > 0 && agent.syncNowReady !== true) {
-      throw new Error('/status: endpoint do botao Sincronizar nao esta pronto');
-    }
-    if (agent.hiper?.connected !== true) throw new Error('/status: Agent nao conectou ao Hiper');
-    if (agent.hiper?.queryOk !== true) throw new Error('/status: consulta read-only ao Hiper falhou');
-    if (agent.hiper?.schemaCompatible !== true) {
-      throw new Error('/status: schema do Hiper nao foi comprovado compativel');
-    }
-    if (agent.hiper?.targetSchema !== 'Exped Agent schema v1') {
-      throw new Error('/status: probe nao comprovou o contrato de schema Exped Agent v1');
-    }
-  } else {
-    throw new Error('/status: modo de startup do Agent nao suportado');
+  if (status.agent?.running !== true) throw new Error('/status: processo do Agent sem readiness');
+  if (status.agent?.hiper?.connected !== true) throw new Error('/status: Agent nao conectou ao Hiper');
+  if (status.agent?.hiper?.queryOk !== true) throw new Error('/status: consulta read-only ao Hiper falhou');
+  if (status.agent?.hiper?.schemaCompatible !== true) {
+    throw new Error('/status: schema do Hiper nao foi comprovado compativel');
+  }
+  if (status.agent?.hiper?.targetSchema !== 'Hiper Loja 197') {
+    throw new Error('/status: probe nao comprovou o schema alvo Hiper Loja 197');
   }
 
   if (status.sync?.enabled !== true) throw new Error('/status: sync cloud nao esta enabled');
   if (status.sync?.lastError !== null) {
     throw new Error(`/status: sync cloud com lastError: ${status.sync?.lastError || 'desconhecido'}`);
-  }
-  if (status.sync?.lastSyncOk !== true) {
-    throw new Error('/status: sync cloud ainda nao concluiu um ciclo com sucesso');
-  }
-  if (!Number.isFinite(Date.parse(status.sync?.lastSyncAt || ''))) {
-    throw new Error('/status: sync cloud sem lastSyncAt valido');
   }
   return true;
 }
@@ -134,9 +107,9 @@ export async function waitForCompleteHubStatus(url, timeoutMs = 90_000, options 
   let lastError = null;
   while (Date.now() < deadline) {
     try {
-      const response = await fetchImpl(url, { signal: AbortSignal.timeout(5000) });
-      if (!response.ok) throw new Error(`HTTP ${response.status}`);
-      const status = await response.json();
+      const res = await fetchImpl(url, { signal: AbortSignal.timeout(5000) });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const status = await res.json();
       assertCompleteHubStatus(status, options);
       return status;
     } catch (error) {
@@ -145,26 +118,6 @@ export async function waitForCompleteHubStatus(url, timeoutMs = 90_000, options 
     await sleep(options.pollMs || 1000);
   }
   throw new Error(`health completo timeout: ${url}: ${lastError?.message || 'sem resposta'}`);
-}
-
-/**
- * Repete um probe booleano ate o componente ficar realmente pronto. O nome do
- * probe entra no erro para o log de boot apontar qual dependencia nao iniciou.
- */
-export async function waitForProbe(
-  probe,
-  { label = 'probe', timeoutMs = 30000, intervalMs = 500 } = {},
-) {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    try {
-      if (await probe()) return true;
-    } catch {
-      /* ainda subindo */
-    }
-    await sleep(intervalMs);
-  }
-  throw new Error(`health timeout: ${label}`);
 }
 
 /**

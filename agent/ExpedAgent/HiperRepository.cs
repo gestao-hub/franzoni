@@ -17,24 +17,13 @@ public sealed record AgentReadinessSnapshot(
     [property: JsonPropertyName("pid")] int Pid,
     [property: JsonPropertyName("agentVersion")] string AgentVersion,
     [property: JsonPropertyName("checkedAt")] string CheckedAt,
-    [property: JsonPropertyName("lastSyncNowAt")] string? LastSyncNowAt,
-    [property: JsonPropertyName("lastSyncNowOk")] bool? LastSyncNowOk,
-    [property: JsonPropertyName("lastSyncNowSynced")] int? LastSyncNowSynced,
     [property: JsonPropertyName("hiper")] HiperReadiness Hiper)
 {
     public static AgentReadinessSnapshot Create(
         int processId,
         string agentVersion,
-        HiperReadiness hiper,
-        SyncNowObservation? syncNow = null) =>
-        new(
-            processId,
-            agentVersion,
-            DateTimeOffset.UtcNow.ToString("O"),
-            syncNow?.CompletedAt,
-            syncNow?.Ok,
-            syncNow?.Synced,
-            hiper);
+        HiperReadiness hiper) =>
+        new(processId, agentVersion, DateTimeOffset.UtcNow.ToString("O"), hiper);
 }
 
 // ⚠️ Nomes de coluna do cliente (numero_endereco, fone_primario_*, etc.) vieram do
@@ -42,34 +31,31 @@ public sealed record AgentReadinessSnapshot(
 public sealed class HiperRepository(string connectionString)
 {
     private readonly string _cs = connectionString;
-    public static readonly IReadOnlyList<(string Table, string Column)> RequiredColumns =
+
+    public static readonly IReadOnlyList<(string Table, string Column)> Hiper197RequiredColumns =
     [
         ("pedido_venda", "id_pedido_venda"), ("pedido_venda", "codigo"),
         ("pedido_venda", "situacao"), ("pedido_venda", "data_hora_geracao"),
         ("pedido_venda", "id_entidade_cliente"), ("pedido_venda", "id_usuario_vendedor"),
-        ("pedido_venda", "id_usuario_geracao"),
         ("pedido_venda", "data_previsao_entrega_final"),
         ("pedido_venda", "data_previsao_entrega_inicial"), ("pedido_venda", "observacao"),
         ("pedido_venda", "valor_frete"), ("pedido_venda", "excluido"),
-        ("entidade", "id_entidade"), ("entidade", "nome"),
-        ("entidade", "logradouro"), ("entidade", "numero_endereco"),
-        ("entidade", "complemento"), ("entidade", "bairro"), ("entidade", "cep"),
+        ("entidade", "nome"), ("entidade", "logradouro"),
+        ("entidade", "numero_endereco"), ("entidade", "complemento"),
+        ("entidade", "bairro"), ("entidade", "cep"),
         ("entidade", "fone_primario_ddd"), ("entidade", "fone_primario_numero"),
-        ("entidade", "id_cidade"), ("pessoa_fisica", "id_entidade"),
-        ("pessoa_fisica", "cpf"), ("pessoa_juridica", "id_entidade"),
+        ("entidade", "id_cidade"), ("pessoa_fisica", "cpf"),
         ("pessoa_juridica", "cnpj"), ("cidade", "nome"), ("cidade", "uf"),
-        ("cidade", "id_cidade"), ("item_pedido_venda", "id_pedido_venda"),
-        ("item_pedido_venda", "sequencia_item"), ("item_pedido_venda", "id_produto"),
-        ("item_pedido_venda", "valor_unitario"),
+        ("cidade", "id_cidade"), ("item_pedido_venda", "sequencia_item"),
+        ("item_pedido_venda", "id_produto"), ("item_pedido_venda", "valor_unitario"),
         ("item_pedido_venda", "valor_unitario_com_desconto"),
-        ("item_pedido_venda", "data_hora_cadastro"),
         ("item_pedido_venda", "excluido"), ("item_pedido_venda", "cancelado"),
         ("grade_pedido_venda", "quantidade"), ("grade_pedido_venda", "sequencia_item"),
         ("grade_pedido_venda", "id_pedido_venda"), ("produto", "codigo"),
         ("produto", "nome"), ("produto", "id_produto"),
     ];
 
-    public const string ReadOnlyProbeSql = @"
+    public const string Hiper197ReadOnlyProbeSql = @"
 SELECT TOP (1)
        pv.id_pedido_venda,
        pv.codigo,
@@ -77,18 +63,17 @@ SELECT TOP (1)
        pv.data_hora_geracao,
        pv.id_entidade_cliente,
        pv.id_usuario_vendedor,
-       pv.id_usuario_geracao,
        pv.excluido
 FROM pedido_venda pv WITH (NOLOCK)
 ORDER BY pv.id_pedido_venda DESC;";
 
-    public static List<string> GetMissingRequiredColumns(
+    public static List<string> GetMissingHiper197Columns(
         IEnumerable<(string Table, string Column)> existing)
     {
         var found = new HashSet<string>(
             existing.Select(item => $"{item.Table}.{item.Column}"),
             StringComparer.OrdinalIgnoreCase);
-        return RequiredColumns
+        return Hiper197RequiredColumns
             .Where(item => !found.Contains($"{item.Table}.{item.Column}"))
             .Select(item => $"{item.Table}.{item.Column}")
             .ToList();
@@ -98,11 +83,12 @@ ORDER BY pv.id_pedido_venda DESC;";
         SqlConnection connection,
         CancellationToken ct)
     {
-        var tables = RequiredColumns.Select(item => item.Table).Distinct().ToArray();
+        var tables = Hiper197RequiredColumns.Select(item => item.Table).Distinct().ToArray();
         var names = tables.Select((_, i) => "@t" + i).ToArray();
         var sql = $"select TABLE_NAME, COLUMN_NAME from INFORMATION_SCHEMA.COLUMNS " +
                   $"where TABLE_NAME in ({string.Join(",", names)})";
-        var found = new HashSet<(string Table, string Column)>();
+        var found = new HashSet<(string Table, string Column)>(
+            EqualityComparer<(string Table, string Column)>.Default);
         await using var command = new SqlCommand(sql, connection) { CommandTimeout = 10 };
         for (var i = 0; i < tables.Length; i++) command.Parameters.AddWithValue(names[i], tables[i]);
         await using var reader = await command.ExecuteReaderAsync(ct);
@@ -111,7 +97,7 @@ ORDER BY pv.id_pedido_venda DESC;";
     }
 
     /// <summary>
-    /// Readiness do contrato de schema consumido pelo Exped Agent. Abre a mesma Trusted_Connection,
+    /// Readiness do Hiper Loja 197. Abre a mesma Trusted_Connection do Agent,
     /// confere as colunas consumidas e executa uma consulta real somente leitura.
     /// Conexao, query e compatibilidade permanecem sinais independentes.
     /// </summary>
@@ -145,10 +131,10 @@ ORDER BY pv.id_pedido_venda DESC;";
             }
 
             var existing = await ReadSchemaColumnsAsync(connection, ct);
-            missing = GetMissingRequiredColumns(existing);
+            missing = GetMissingHiper197Columns(existing);
 
             int? sampleOrderId = null;
-            await using (var probe = new SqlCommand(ReadOnlyProbeSql, connection) { CommandTimeout = 10 })
+            await using (var probe = new SqlCommand(Hiper197ReadOnlyProbeSql, connection) { CommandTimeout = 10 })
             await using (var reader = await probe.ExecuteReaderAsync(ct))
             {
                 if (await reader.ReadAsync(ct) && !reader.IsDBNull(0)) sampleOrderId = reader.GetInt32(0);
@@ -156,18 +142,30 @@ ORDER BY pv.id_pedido_venda DESC;";
 
             var compatible = missing.Count == 0;
             return new(
-                true, true, compatible, AgentInfo.HiperSchemaTarget, database, serverVersion,
-                sampleOrderId, missing,
+                true,
+                true,
+                compatible,
+                AgentInfo.HiperSchemaTarget,
+                database,
+                serverVersion,
+                sampleOrderId,
+                missing,
                 compatible ? null : $"Colunas ausentes: {string.Join(", ", missing)}");
         }
         catch (Exception ex)
         {
             return new(
-                true, false, false, AgentInfo.HiperSchemaTarget, database, serverVersion,
-                null, missing, ex.Message);
+                true,
+                false,
+                false,
+                AgentInfo.HiperSchemaTarget,
+                database,
+                serverVersion,
+                null,
+                missing,
+                ex.Message);
         }
     }
-
     // As queries de NF/Pagamento dependem da tabela pedido_venda_operacao_pdv, que so
     // existe em versoes mais novas do Hiper. Cacheamos a existencia pra pular essas
     // queries em silencio em versoes antigas (ex.: Franzoni) — sem logar "Invalid column".
@@ -190,15 +188,11 @@ ORDER BY pv.id_pedido_venda DESC;";
         if (situacoes is null || situacoes.Length == 0) return new();
         // placeholders dinâmicos @s0,@s1,... — só NOMES de parâmetro entram na string;
         // os VALORES vão por SqlParameter (sem interpolar dados → sem risco de injeção).
-        // Vendedor: orçamento sem vendedor atribuído tem id_usuario_vendedor NULL/0; nesse caso
-        // caímos pra id_usuario_geracao (quem CRIOU o orçamento = login do vendedor). v1.4.1.
         var nomes = situacoes.Select((_, i) => "@s" + i).ToArray();
         string sql = $@"
 SELECT pv.id_pedido_venda, pv.codigo, pv.data_hora_geracao, pv.id_entidade_cliente,
-       COALESCE(NULLIF(pv.id_usuario_vendedor, 0), pv.id_usuario_geracao) AS id_usuario_vendedor, pv.data_previsao_entrega_final, pv.data_previsao_entrega_inicial,
-       pv.observacao, pv.valor_frete,
-       (SELECT MAX(ipv.data_hora_cadastro) FROM item_pedido_venda ipv WITH (NOLOCK)
-          WHERE ipv.id_pedido_venda = pv.id_pedido_venda AND ipv.excluido = 0 AND ipv.cancelado = 0) AS ult_item_cadastro
+       pv.id_usuario_vendedor, pv.data_previsao_entrega_final, pv.data_previsao_entrega_inicial,
+       pv.observacao, pv.valor_frete
 FROM pedido_venda pv WITH (NOLOCK)
 WHERE pv.excluido = 0 AND pv.situacao IN ({string.Join(",", nomes)}) AND pv.id_pedido_venda > @hwm
 ORDER BY pv.id_pedido_venda;";
@@ -215,109 +209,14 @@ ORDER BY pv.id_pedido_venda;";
             list.Add(new PedidoHeader
             {
                 IdPedidoVenda = r.GetInt32(0),
-                Codigo = r.IsDBNull(1) ? "" : r.GetString(1),
-                DataHoraGeracao = r.IsDBNull(2) ? DateTime.Now : r.GetDateTime(2),
-                IdEntidadeCliente = r.IsDBNull(3) ? 0 : Convert.ToInt32(r.GetValue(3)),
+                Codigo = r.GetString(1),
+                DataHoraGeracao = r.GetDateTime(2),
+                IdEntidadeCliente = r.GetInt32(3),
                 IdUsuarioVendedor = r.IsDBNull(4) ? 0 : Convert.ToInt32(r.GetValue(4)), // id_usuario_vendedor é smallint no Hiper
                 DataEntrega = !r.IsDBNull(5) ? r.GetDateTime(5) : (r.IsDBNull(6) ? null : r.GetDateTime(6)),
                 DataEntregaInicio = r.IsDBNull(6) ? null : r.GetDateTime(6),
                 Observacao = r.IsDBNull(7) ? null : r.GetString(7),
                 ValorFrete = r.IsDBNull(8) ? 0m : Convert.ToDecimal(r.GetValue(8)),
-                UltItemCadastro = r.IsDBNull(9) ? (DateTime?)null : r.GetDateTime(9),
-            });
-        }
-        return list;
-    }
-
-    /// <summary>
-    /// "Puxar" (sob demanda): pedidos RECENTES (últimas 48h) de um conjunto de usuários do Hiper
-    /// — id_usuario_vendedor OU id_usuario_geracao (mesmo COALESCE do scan). Pula a estabilização
-    /// (o vendedor clicou confirmando que terminou). Mesma projeção do NovosPedidosAsync.
-    /// </summary>
-    public async Task<List<PedidoHeader>> PedidosRecentesPorUsuarioAsync(int[] hiperIds, short[] situacoes, CancellationToken ct)
-    {
-        if (hiperIds is null || hiperIds.Length == 0 || situacoes is null || situacoes.Length == 0) return new();
-        var nomesSit = situacoes.Select((_, i) => "@s" + i).ToArray();
-        var nomesU = hiperIds.Select((_, i) => "@u" + i).ToArray();
-        string sql = $@"
-SELECT pv.id_pedido_venda, pv.codigo, pv.data_hora_geracao, pv.id_entidade_cliente,
-       COALESCE(NULLIF(pv.id_usuario_vendedor, 0), pv.id_usuario_geracao) AS id_usuario_vendedor, pv.data_previsao_entrega_final, pv.data_previsao_entrega_inicial,
-       pv.observacao, pv.valor_frete,
-       (SELECT MAX(ipv.data_hora_cadastro) FROM item_pedido_venda ipv WITH (NOLOCK)
-          WHERE ipv.id_pedido_venda = pv.id_pedido_venda AND ipv.excluido = 0 AND ipv.cancelado = 0) AS ult_item_cadastro
-FROM pedido_venda pv WITH (NOLOCK)
-WHERE pv.excluido = 0 AND pv.situacao IN ({string.Join(",", nomesSit)})
-  AND COALESCE(NULLIF(pv.id_usuario_vendedor, 0), pv.id_usuario_geracao) IN ({string.Join(",", nomesU)})
-  AND pv.data_hora_geracao > DATEADD(hour, -48, GETDATE())
-ORDER BY pv.id_pedido_venda DESC;";
-        var list = new List<PedidoHeader>();
-        await using var cn = new SqlConnection(_cs);
-        await cn.OpenAsync(ct);
-        await using var cmd = new SqlCommand(sql, cn);
-        for (int i = 0; i < situacoes.Length; i++) cmd.Parameters.AddWithValue(nomesSit[i], situacoes[i]);
-        for (int i = 0; i < hiperIds.Length; i++) cmd.Parameters.AddWithValue(nomesU[i], hiperIds[i]);
-        await using var r = await cmd.ExecuteReaderAsync(ct);
-        while (await r.ReadAsync(ct))
-        {
-            list.Add(new PedidoHeader
-            {
-                IdPedidoVenda = r.GetInt32(0),
-                Codigo = r.IsDBNull(1) ? "" : r.GetString(1),
-                DataHoraGeracao = r.IsDBNull(2) ? DateTime.Now : r.GetDateTime(2),
-                IdEntidadeCliente = r.IsDBNull(3) ? 0 : Convert.ToInt32(r.GetValue(3)),
-                IdUsuarioVendedor = r.IsDBNull(4) ? 0 : Convert.ToInt32(r.GetValue(4)),
-                DataEntrega = !r.IsDBNull(5) ? r.GetDateTime(5) : (r.IsDBNull(6) ? null : r.GetDateTime(6)),
-                DataEntregaInicio = r.IsDBNull(6) ? null : r.GetDateTime(6),
-                Observacao = r.IsDBNull(7) ? null : r.GetString(7),
-                ValorFrete = r.IsDBNull(8) ? 0m : Convert.ToDecimal(r.GetValue(8)),
-                UltItemCadastro = r.IsDBNull(9) ? (DateTime?)null : r.GetDateTime(9),
-            });
-        }
-        return list;
-    }
-
-    /// <summary>
-    /// Backfill: pedidos elegiveis numa JANELA de id (floorExclusive, ceilingInclusive].
-    /// Repesca os que so viraram elegiveis (sit 2/5/7) DEPOIS do cursor (HWM) passar — orcamento
-    /// finalizado fora de ordem de id. Mesma projecao do NovosPedidosAsync.
-    /// </summary>
-    public async Task<List<PedidoHeader>> PedidosNoIntervaloAsync(int floorExclusive, int ceilingInclusive, short[] situacoes, CancellationToken ct)
-    {
-        if (situacoes is null || situacoes.Length == 0 || ceilingInclusive <= floorExclusive) return new();
-        var nomes = situacoes.Select((_, i) => "@s" + i).ToArray();
-        string sql = $@"
-SELECT pv.id_pedido_venda, pv.codigo, pv.data_hora_geracao, pv.id_entidade_cliente,
-       COALESCE(NULLIF(pv.id_usuario_vendedor, 0), pv.id_usuario_geracao) AS id_usuario_vendedor, pv.data_previsao_entrega_final, pv.data_previsao_entrega_inicial,
-       pv.observacao, pv.valor_frete,
-       (SELECT MAX(ipv.data_hora_cadastro) FROM item_pedido_venda ipv WITH (NOLOCK)
-          WHERE ipv.id_pedido_venda = pv.id_pedido_venda AND ipv.excluido = 0 AND ipv.cancelado = 0) AS ult_item_cadastro
-FROM pedido_venda pv WITH (NOLOCK)
-WHERE pv.excluido = 0 AND pv.situacao IN ({string.Join(",", nomes)})
-  AND pv.id_pedido_venda > @floor AND pv.id_pedido_venda <= @ceil
-ORDER BY pv.id_pedido_venda;";
-        var list = new List<PedidoHeader>();
-        await using var cn = new SqlConnection(_cs);
-        await cn.OpenAsync(ct);
-        await using var cmd = new SqlCommand(sql, cn);
-        for (int i = 0; i < situacoes.Length; i++)
-            cmd.Parameters.AddWithValue(nomes[i], situacoes[i]);
-        cmd.Parameters.AddWithValue("@floor", floorExclusive);
-        cmd.Parameters.AddWithValue("@ceil", ceilingInclusive);
-        await using var r = await cmd.ExecuteReaderAsync(ct);
-        while (await r.ReadAsync(ct))
-        {
-            list.Add(new PedidoHeader
-            {
-                IdPedidoVenda = r.GetInt32(0),
-                Codigo = r.IsDBNull(1) ? "" : r.GetString(1),
-                DataHoraGeracao = r.IsDBNull(2) ? DateTime.Now : r.GetDateTime(2),
-                IdEntidadeCliente = r.IsDBNull(3) ? 0 : Convert.ToInt32(r.GetValue(3)),
-                IdUsuarioVendedor = r.IsDBNull(4) ? 0 : Convert.ToInt32(r.GetValue(4)),
-                DataEntrega = !r.IsDBNull(5) ? r.GetDateTime(5) : (r.IsDBNull(6) ? null : r.GetDateTime(6)),
-                DataEntregaInicio = r.IsDBNull(6) ? null : r.GetDateTime(6),
-                Observacao = r.IsDBNull(7) ? null : r.GetString(7),
-                ValorFrete = r.IsDBNull(8) ? 0m : Convert.ToDecimal(r.GetValue(8)),
-                UltItemCadastro = r.IsDBNull(9) ? (DateTime?)null : r.GetDateTime(9),
             });
         }
         return list;
@@ -344,7 +243,7 @@ WHERE e.id_entidade = @id;";
         string? S(int i) => r.IsDBNull(i) ? null : Convert.ToString(r.GetValue(i));
         return new ClienteRow
         {
-            Nome = r.IsDBNull(0) ? "" : r.GetString(0), CpfCnpj = S(1), Logradouro = S(2), Numero = S(3),
+            Nome = r.GetString(0), CpfCnpj = S(1), Logradouro = S(2), Numero = S(3),
             Complemento = S(4), Bairro = S(5), Cep = S(6), Cidade = S(7), Uf = S(8),
             FoneDdd = S(9), FoneNumero = S(10),
         };
@@ -355,9 +254,9 @@ WHERE e.id_entidade = @id;";
         const string sql = @"
 SELECT p.codigo, p.nome, g.quantidade, ipv.valor_unitario, ipv.valor_unitario_com_desconto, ipv.id_produto
 FROM item_pedido_venda ipv WITH (NOLOCK)
-LEFT JOIN grade_pedido_venda g WITH (NOLOCK)
+JOIN grade_pedido_venda g WITH (NOLOCK)
   ON g.id_pedido_venda = ipv.id_pedido_venda AND g.sequencia_item = ipv.sequencia_item
-LEFT JOIN produto p WITH (NOLOCK) ON p.id_produto = ipv.id_produto
+JOIN produto p WITH (NOLOCK) ON p.id_produto = ipv.id_produto
 WHERE ipv.id_pedido_venda = @id AND ipv.excluido = 0 AND ipv.cancelado = 0
 ORDER BY ipv.sequencia_item;";
         var list = new List<ItemRow>();
@@ -368,21 +267,14 @@ ORDER BY ipv.sequencia_item;";
         await using var r = await cmd.ExecuteReaderAsync(ct);
         while (await r.ReadAsync(ct))
         {
-            // Blindagem: campo vazio no Hiper (ex.: grade.quantidade NULL em orçamento) NÃO pode
-            // estourar o agente. NULL vira 0 / "". valor_unitario_com_desconto NULL = sem desconto (vira o vu).
-            decimal vu = r.IsDBNull(3) ? 0m : Convert.ToDecimal(r.GetValue(3));
-            decimal vd = r.IsDBNull(4) ? vu : Convert.ToDecimal(r.GetValue(4));
-            int idProd = r.IsDBNull(5) ? 0 : Convert.ToInt32(r.GetValue(5));
-            string desc = r.IsDBNull(1) ? "" : (Convert.ToString(r.GetValue(1)) ?? "");
-            if (string.IsNullOrWhiteSpace(desc)) desc = idProd > 0 ? $"Produto {idProd}" : "Item"; // item sem produto (LEFT JOIN)
             list.Add(new ItemRow
             {
-                Codigo = r.IsDBNull(0) ? "" : (Convert.ToString(r.GetValue(0)) ?? ""),
-                Descricao = desc,
-                Quantidade = r.IsDBNull(2) ? 0m : Convert.ToDecimal(r.GetValue(2)),
-                ValorUnitario = vu,
-                ValorUnitarioComDesconto = vd,
-                IdProduto = idProd,
+                Codigo = Convert.ToString(r.GetValue(0)) ?? "",
+                Descricao = r.GetString(1),
+                Quantidade = r.GetDecimal(2),
+                ValorUnitario = r.GetDecimal(3),
+                ValorUnitarioComDesconto = r.GetDecimal(4),
+                IdProduto = r.IsDBNull(5) ? 0 : Convert.ToInt32(r.GetValue(5)),
             });
         }
         return list;
@@ -445,54 +337,6 @@ ORDER BY nf.data_hora_emissao DESC;";
     }
 
     /// <summary>
-    /// #3 NF-e em LOTE (best-effort): a última NF de CADA pedido da lista, numa única query
-    /// (antes era 1 query por item, todo ciclo → o re-sync de NF pendente inflava o ciclo e
-    /// atrasava o pedido novo). Devolve só os que já têm NF; ausentes = ainda não faturados.
-    /// ROW_NUMBER pega a NF mais recente por pedido. Chunk de 500 ids (limite de params do SQL Server).
-    /// </summary>
-    public async Task<Dictionary<int, (string? Numero, string? Chave, DateTime? Emitida, decimal? Valor)>> NfDosPedidosAsync(
-        IReadOnlyList<int> ids, CancellationToken ct)
-    {
-        var map = new Dictionary<int, (string?, string?, DateTime?, decimal?)>();
-        if (ids is null || ids.Count == 0) return map;
-        if (!await PdvOperacaoExisteAsync(ct)) return map; // Hiper antigo: sem essa tabela, sem NF
-
-        await using var cn = new SqlConnection(_cs);
-        await cn.OpenAsync(ct);
-        const int chunk = 500;
-        for (int off = 0; off < ids.Count && !ct.IsCancellationRequested; off += chunk)
-        {
-            var slice = ids.Skip(off).Take(chunk).ToArray();
-            var nomes = slice.Select((_, i) => "@id" + i).ToArray();
-            string sql = $@"
-SELECT id_pedido_venda, numero_documento_fiscal, chave_documento_fiscal, data_hora_emissao, valor_total
-FROM (
-  SELECT pvo.id_pedido_venda,
-         nf.numero_documento_fiscal, nf.chave_documento_fiscal, nf.data_hora_emissao, nf.valor_total,
-         ROW_NUMBER() OVER (PARTITION BY pvo.id_pedido_venda ORDER BY nf.data_hora_emissao DESC) AS rn
-  FROM pedido_venda_operacao_pdv pvo WITH (NOLOCK)
-  JOIN operacao_pdv op WITH (NOLOCK) ON op.id_operacao = pvo.id_operacao
-  JOIN nota_fiscal nf WITH (NOLOCK) ON nf.id_nota_fiscal = op.id_nota_fiscal
-  WHERE pvo.id_pedido_venda IN ({string.Join(",", nomes)})
-) t WHERE t.rn = 1;";
-            await using var cmd = new SqlCommand(sql, cn);
-            for (int i = 0; i < slice.Length; i++) cmd.Parameters.AddWithValue(nomes[i], slice[i]);
-            await using var r = await cmd.ExecuteReaderAsync(ct);
-            while (await r.ReadAsync(ct))
-            {
-                int id = Convert.ToInt32(r.GetValue(0));
-                map[id] = (
-                    r.IsDBNull(1) ? null : Convert.ToString(r.GetValue(1)),
-                    r.IsDBNull(2) ? null : Convert.ToString(r.GetValue(2)),
-                    r.IsDBNull(3) ? null : r.GetDateTime(3),
-                    r.IsDBNull(4) ? null : Convert.ToDecimal(r.GetValue(4))
-                );
-            }
-        }
-        return map;
-    }
-
-    /// <summary>
     /// #2 PAGAMENTO ao finalizar (best-effort): forma + parcelas estruturadas do Hiper.
     /// Confirmado no raio-x: negociacao_finalizador(id_finalizador, numero_parcelas, valor_parcelas)
     /// → finalizador_pdv (catálogo: Dinheiro/Cheque/Cartão/Pix/...). SÓ existe em pedido FINALIZADO.
@@ -529,40 +373,10 @@ ORDER BY nfin.valor_parcelas DESC;";
     /// </summary>
     public async Task<List<string>> VerificarSchemaAsync(CancellationToken ct)
     {
-        var esperado = new (string T, string C)[]
-        {
-            ("pedido_venda","id_pedido_venda"), ("pedido_venda","codigo"), ("pedido_venda","situacao"),
-            ("pedido_venda","data_hora_geracao"), ("pedido_venda","id_entidade_cliente"),
-            ("pedido_venda","id_usuario_vendedor"), ("pedido_venda","data_previsao_entrega_final"),
-            ("pedido_venda","data_previsao_entrega_inicial"), ("pedido_venda","observacao"),
-            ("pedido_venda","valor_frete"), ("pedido_venda","excluido"),
-            ("entidade","nome"), ("entidade","logradouro"), ("entidade","numero_endereco"), ("entidade","complemento"),
-            ("entidade","bairro"), ("entidade","cep"), ("entidade","fone_primario_ddd"),
-            ("entidade","fone_primario_numero"), ("entidade","id_cidade"),
-            ("pessoa_fisica","cpf"), ("pessoa_juridica","cnpj"),
-            ("cidade","nome"), ("cidade","uf"), ("cidade","id_cidade"),
-            ("item_pedido_venda","sequencia_item"), ("item_pedido_venda","id_produto"),
-            ("item_pedido_venda","valor_unitario"), ("item_pedido_venda","valor_unitario_com_desconto"),
-            ("item_pedido_venda","excluido"), ("item_pedido_venda","cancelado"), ("item_pedido_venda","data_hora_cadastro"),
-            ("grade_pedido_venda","quantidade"), ("grade_pedido_venda","sequencia_item"),
-            ("grade_pedido_venda","id_pedido_venda"),
-            ("produto","codigo"), ("produto","nome"), ("produto","id_produto"),
-        };
-        var tabelas = esperado.Select(e => e.T).Distinct().ToArray();
-        var nomes = tabelas.Select((_, i) => "@t" + i).ToArray();
-        var sql = $"select TABLE_NAME, COLUMN_NAME from INFORMATION_SCHEMA.COLUMNS where TABLE_NAME in ({string.Join(",", nomes)})";
-        var existentes = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         await using var cn = new SqlConnection(_cs);
         await cn.OpenAsync(ct);
-        await using var cmd = new SqlCommand(sql, cn);
-        for (int i = 0; i < tabelas.Length; i++) cmd.Parameters.AddWithValue(nomes[i], tabelas[i]);
-        await using var r = await cmd.ExecuteReaderAsync(ct);
-        while (await r.ReadAsync(ct))
-            existentes.Add($"{r.GetString(0)}.{r.GetString(1)}");
-        return esperado
-            .Where(e => !existentes.Contains($"{e.T}.{e.C}"))
-            .Select(e => $"{e.T}.{e.C}")
-            .ToList();
+        var existing = await ReadSchemaColumnsAsync(cn, ct);
+        return GetMissingHiper197Columns(existing);
     }
 
     // ===== Ordem de Serviço (colunas confirmadas no raio-x do schema) =====

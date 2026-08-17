@@ -37,7 +37,6 @@ if ($ManageAgentEnabled) {
     }
     . $AgentSettingsHelper
 }
-
 function Write-Step($msg) { Write-Host "==> $msg" -ForegroundColor Cyan }
 
 function Test-AgentSid($Sid) {

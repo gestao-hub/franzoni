@@ -32,28 +32,21 @@ import { createWriteStream, existsSync, readFileSync } from 'node:fs';
 import { mkdir } from 'node:fs/promises';
 import { execFileSync } from 'node:child_process';
 
-import { rotateLogFileSync, Supervisor } from './supervisor.mjs';
-import {
-  assertCompleteHubStatus,
-  readAgentReadiness,
-  waitForCompleteHubStatus,
-  waitForHttp,
-  waitForProbe,
-  waitForTcp,
-  tcpAlive,
-} from './health.mjs';
+import { Supervisor } from './supervisor.mjs';
+import { readAgentReadiness, waitForHttp, waitForTcp, tcpAlive } from './health.mjs';
 import { startStorage } from './storage-local.mjs';
 import { loadConfig } from './config.mjs';
-import { bootstrap, applyPendingMigrations, reloadPostgrest } from './bootstrap.mjs';
+import { bootstrap, applyPendingMigrations } from './bootstrap.mjs';
 import { checkAndUpdate } from './updater.mjs';
 import { makeKeys } from './keys.mjs';
 import { exe } from './platform.mjs';
 import * as sync from './sync.mjs';
-import { sanitizeSyncError } from './sync-state.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const LS = path.join(ROOT, 'scripts', 'local-stack');
 const PG_BIN = process.env.EXPED_PG_BIN || '/usr/lib/postgresql/16/bin';
+
+const noopLogger = { info: () => {}, error: () => {} };
 
 /** logger simples: console + (se logPath) arquivo append. */
 function makeLogger(logPath) {
@@ -94,108 +87,6 @@ export function needsInitdb(pgDataDir) {
 }
 
 /**
- * `waitForTcp` nao basta para Postgres: durante recovery a porta ja aceita TCP,
- * mas o servidor ainda rejeita queries. pg_isready retorna sucesso somente
- * quando novas conexoes sao aceitas.
- */
-export function postgresAcceptingConnections(cfg, run = execFileSync) {
-  try {
-    run(
-      exe(path.join(PG_BIN, 'pg_isready')),
-      [
-        '-h', pgTcpHost(cfg),
-        '-p', String(cfg.ports.pg),
-        '-d', 'postgres',
-        '-U', cfg.paths.user || 'postgres',
-        '-q',
-      ],
-      { stdio: 'ignore', timeout: 3000 },
-    );
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-export function waitForPostgresReady(
-  cfg,
-  { timeoutMs = 30000, intervalMs = 500, probe = postgresAcceptingConnections } = {},
-) {
-  return waitForProbe(() => probe(cfg), {
-    label: `postgres accepting connections at ${pgTcpHost(cfg)}:${cfg.ports.pg}`,
-    timeoutMs,
-    intervalMs,
-  });
-}
-
-export async function agentHttpReady(port, request = fetch) {
-  try {
-    const response = await request(`http://127.0.0.1:${port}/sync-now`, {
-      signal: AbortSignal.timeout(1000),
-    });
-    if (response.status !== 400) return false;
-    const body = await response.json();
-    return (
-      body &&
-      typeof body === 'object' &&
-      body.success === false &&
-      Number.isInteger(body.synced) &&
-      typeof body.error === 'string'
-    );
-  } catch {
-    return false;
-  }
-}
-
-export async function agentRuntimeStatus(
-  agent = {},
-  probe = agentHttpReady,
-  readReadiness = readAgentReadiness,
-) {
-  const port = Number.isInteger(agent.syncNowPort) ? agent.syncNowPort : 0;
-  const startupMode = agent.startupMode || 'interactive_logon';
-  const enabled = startupMode === 'interactive_logon';
-  const requiresInteractiveLogon = enabled;
-  const recovery = {
-    mechanism: enabled ? 'interactive_logon' : 'disabled',
-    guaranteedBeforeLogon: false,
-    diagnostic: enabled
-      ? 'O Agent recupera somente apos logon da conta operacional; pre-login nao e garantido.'
-      : 'Agent desativado neste pacote; nao ha recuperacao pre-login.',
-  };
-
-  if (!enabled) {
-    return {
-      enabled: false,
-      running: false,
-      port,
-      syncNowPort: port,
-      syncNowReady: false,
-      startupMode,
-      requiresInteractiveLogon: false,
-      survivesRebootWithoutLogon: false,
-      recovery,
-    };
-  }
-
-  const readiness = await readReadiness(agent.healthPath, {
-    maxAgeMs: agent.healthMaxAgeMs,
-  });
-  const syncNowReady = port > 0 ? await probe(port) : false;
-  return {
-    ...readiness,
-    enabled,
-    port,
-    syncNowPort: port,
-    syncNowReady,
-    startupMode,
-    requiresInteractiveLogon,
-    survivesRebootWithoutLogon: false,
-    recovery,
-  };
-}
-
-/**
  * Resolve o entrypoint do app testando, em ordem:
  *   1. <releasesDir>/<pointer>/server.js  (release adotada pelo auto-update)
  *   2. <root>/app/server.js               (base instalada)
@@ -205,7 +96,6 @@ export function resolveAppEntrypoint(root, releasesDir, pointer, exists = exists
   if (pointer && releasesDir) {
     const rel = path.join(releasesDir, pointer, 'server.js');
     if (exists(rel)) return rel;
-    throw new Error(`release apontada ${pointer} sem entrypoint: ${rel}`);
   }
   const installer = path.join(root, 'app', 'server.js');
   const dev = path.join(root, '.next', 'standalone', 'server.js');
@@ -225,6 +115,61 @@ export function readPointerSync(ptrPath, read = readFileSync) {
 /** Versão atual do app: ponteiro adotado > cfg.version baked no install > 0.0.0. */
 export function currentAppVersion(pointer, cfgVersion) {
   return pointer || cfgVersion || '0.0.0';
+}
+
+export async function stopSupervisorAndWait(supervisor, timeoutMs = 5000) {
+  if (!supervisor) return true;
+  const child = supervisor.child;
+  supervisor.stop();
+  if (!child || child.exitCode !== null) return true;
+
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (exited) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      child.removeListener?.('exit', onExit);
+      resolve(exited);
+    };
+    const onExit = () => finish(true);
+    const timer = setTimeout(() => {
+      try { child.kill('SIGKILL'); } catch { /* already gone */ }
+      finish(false);
+    }, timeoutMs);
+    timer.unref?.();
+    child.once('exit', onExit);
+  });
+}
+
+export async function stopSupervisorsSequentially(
+  supervisors,
+  stopOne = stopSupervisorAndWait,
+) {
+  const stopped = [];
+  for (const name of ['frontdoor', 'events', 'app', 'gateway', 'gotrue', 'postgrest']) {
+    if (!supervisors[name]) continue;
+    await stopOne(supervisors[name]);
+    stopped.push(name);
+  }
+  return stopped;
+}
+
+function closeServerAndWait(server, timeoutMs = 5000) {
+  if (!server) return Promise.resolve(true);
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (closed) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(closed);
+    };
+    const timer = setTimeout(() => finish(false), timeoutMs);
+    timer.unref?.();
+    try { server.close(() => finish(true)); }
+    catch { finish(false); }
+  });
 }
 
 // --------------------------------------------------------------------------
@@ -356,33 +301,8 @@ function frontdoorSupervisor(cfg, logDir) {
   });
 }
 
-export function appRuntimeEnv(cfg, keys) {
-  const gatewayUrl = `http://127.0.0.1:${cfg.ports.gateway}`;
-  const configuredAgentUrl =
-    cfg.agent?.syncNowPort > 0
-      ? `http://127.0.0.1:${cfg.agent.syncNowPort}`
-      : '';
-  return {
-    PORT: String(cfg.ports.app),
-    HOSTNAME: '127.0.0.1',
-    NODE_ENV: 'production',
-    // Marca explícita de que o app roda no hub (gestão de identidade fica read-only;
-    // a detecção por URL localhost já cobre, isto é robustez/override).
-    EXPED_HUB: '1',
-    // O agente escuta apenas em loopback. Sem esta variável o Server Component
-    // ocultava o botão Sincronizar mesmo no Hub.
-    ...(configuredAgentUrl ? { AGENT_SYNC_URL: configuredAgentUrl } : {}),
-    // SUPABASE_* (não-públicas) são lidas pelo server em runtime (não assadas no build);
-    // NEXT_PUBLIC_* ficam como fallback do cliente do browser. Mesmos valores de propósito.
-    SUPABASE_URL: gatewayUrl,
-    SUPABASE_ANON_KEY: keys.anon,
-    SUPABASE_SERVICE_ROLE_KEY: keys.service,
-    NEXT_PUBLIC_SUPABASE_URL: gatewayUrl,
-    NEXT_PUBLIC_SUPABASE_ANON_KEY: keys.anon,
-  };
-}
-
 function appSupervisor(cfg, logDir, keys) {
+  const gatewayUrl = `http://127.0.0.1:${cfg.ports.gateway}`;
   const releasesDir = cfg.paths.releasesDir || path.join(ROOT, 'releases');
   const ptrPath = cfg.paths.releasesPtr || path.join(releasesDir, 'current');
   return new Supervisor({
@@ -392,120 +312,29 @@ function appSupervisor(cfg, logDir, keys) {
     // Lido a cada start, então o restart pós-update já sobe a versão nova.
     args: [resolveAppEntrypoint(ROOT, releasesDir, readPointerSync(ptrPath))],
     cwd: ROOT,
-    env: appRuntimeEnv(cfg, keys),
+    env: {
+      PORT: String(cfg.ports.app),
+      HOSTNAME: '127.0.0.1',
+      NODE_ENV: 'production',
+      // Marca explícita de que o app roda no hub (gestão de identidade fica read-only;
+      // a detecção por URL localhost já cobre, isto é robustez/override).
+      EXPED_HUB: '1',
+      // SUPABASE_* (não-públicas) são lidas pelo server em runtime (não assadas no build);
+      // NEXT_PUBLIC_* ficam como fallback do cliente do browser. Mesmos valores de propósito.
+      SUPABASE_URL: gatewayUrl,
+      SUPABASE_ANON_KEY: keys.anon,
+      SUPABASE_SERVICE_ROLE_KEY: keys.service,
+      NEXT_PUBLIC_SUPABASE_URL: gatewayUrl,
+      NEXT_PUBLIC_SUPABASE_ANON_KEY: keys.anon,
+    },
     logPath: path.join(logDir, 'app.log'),
     backoffMs: 1500,
   });
 }
 
-export async function replaceAppSupervisor(current, createNext) {
-  await current?.stop();
-  return createNext().start();
-}
-
-export async function stopSupervisorsInOrder(supervisors) {
-  for (const supervisor of supervisors) {
-    await supervisor?.stop();
-  }
-}
-
 // --------------------------------------------------------------------------
 // /status — servidor HTTP interno reportando o estado de cada peça.
 // --------------------------------------------------------------------------
-
-const PUBLIC_PENDING_TABLES = sync.TWO_WAY_TABLES.map((table) => table.name);
-const PUBLIC_PENDING_TABLE_SET = new Set(PUBLIC_PENDING_TABLES);
-const PUBLIC_BLOCKED_PK = /^[a-zA-Z0-9_.:/-]+$/;
-const PUBLIC_SYNC_PHASES = new Set(['idle', 'pushing', 'pulling', 'error']);
-const PUBLIC_TIMESTAMP = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
-const PUBLIC_CONTROL_CHARACTER = /[\u0000-\u001f\u007f]/;
-const PUBLIC_ERROR_MAX_LENGTH = 240;
-
-function ownDataValue(source, key) {
-  if (!source || typeof source !== 'object' || Array.isArray(source)) return undefined;
-  try {
-    const descriptor = Object.getOwnPropertyDescriptor(source, key);
-    return descriptor && Object.hasOwn(descriptor, 'value') ? descriptor.value : undefined;
-  } catch {
-    return undefined;
-  }
-}
-
-function publicBoolean(value, fallback) {
-  return typeof value === 'boolean' ? value : fallback;
-}
-
-function publicNullableBoolean(value) {
-  return value === null || typeof value === 'boolean' ? value : null;
-}
-
-function publicNonNegativeInteger(value) {
-  return Number.isSafeInteger(value) && value >= 0 ? value : 0;
-}
-
-function publicPhase(value) {
-  return typeof value === 'string' && PUBLIC_SYNC_PHASES.has(value) ? value : 'error';
-}
-
-function publicTimestamp(value) {
-  if (value === null) return null;
-  if (typeof value !== 'string' || !PUBLIC_TIMESTAMP.test(value)) return null;
-  const timestamp = Date.parse(value);
-  return Number.isFinite(timestamp) && new Date(timestamp).toISOString() === value ? value : null;
-}
-
-function publicError(value) {
-  if (value === null) return null;
-  const valid =
-    typeof value === 'string' &&
-    value.length > 0 &&
-    value.length <= PUBLIC_ERROR_MAX_LENGTH &&
-    value.trim() === value &&
-    !PUBLIC_CONTROL_CHARACTER.test(value);
-  return valid ? sanitizeSyncError(value) : null;
-}
-
-function publicPendingByTable(pendingByTable) {
-  const projected = {};
-
-  for (const table of PUBLIC_PENDING_TABLES) {
-    const pending = ownDataValue(pendingByTable, table);
-    if (Number.isSafeInteger(pending) && pending >= 0) projected[table] = pending;
-  }
-  return projected;
-}
-
-function publicBlockedRow(blockedRow) {
-  const table = ownDataValue(blockedRow, 'table');
-  const pk = ownDataValue(blockedRow, 'pk');
-  const validTable = typeof table === 'string' && PUBLIC_PENDING_TABLE_SET.has(table);
-  const validPk =
-    typeof pk === 'string' &&
-    pk.length > 0 &&
-    pk.length <= 128 &&
-    PUBLIC_BLOCKED_PK.test(pk);
-  return validTable && validPk ? { table, pk } : null;
-}
-
-export function publicSyncStatus(enabled, state) {
-  return {
-    enabled: publicBoolean(enabled, false),
-    lastSyncOk: publicNullableBoolean(ownDataValue(state, 'lastSyncOk')),
-    pendingPush: publicNonNegativeInteger(ownDataValue(state, 'pendingPush')),
-    pendingByTable: publicPendingByTable(ownDataValue(state, 'pendingByTable')),
-    caughtUp: publicBoolean(ownDataValue(state, 'caughtUp'), false),
-    phase: publicPhase(ownDataValue(state, 'phase')),
-    runningSince: publicTimestamp(ownDataValue(state, 'runningSince')),
-    lastSyncAt: publicTimestamp(ownDataValue(state, 'lastSyncAt')),
-    lastSuccessAt: publicTimestamp(ownDataValue(state, 'lastSuccessAt')),
-    consecutiveFailures: publicNonNegativeInteger(
-      ownDataValue(state, 'consecutiveFailures'),
-    ),
-    lastError: publicError(ownDataValue(state, 'lastError')),
-    lastBlockedRow: publicBlockedRow(ownDataValue(state, 'lastBlockedRow')),
-    lastSkipped: publicNonNegativeInteger(ownDataValue(state, 'lastSkipped')),
-  };
-}
 
 function startStatusServer(port, getState) {
   return new Promise((resolve) => {
@@ -534,6 +363,24 @@ function peerState(sup) {
   };
 }
 
+export async function buildAgentStatus(agentCfg, readReadiness = readAgentReadiness) {
+  const readiness = await readReadiness(agentCfg.healthPath, {
+    maxAgeMs: agentCfg.healthMaxAgeMs,
+  });
+  return {
+    ...readiness,
+    startupMode: agentCfg.startupMode,
+    survivesRebootWithoutLogon: false,
+    syncNowPort: agentCfg.syncNowPort,
+    recovery: {
+      mechanism: 'interactive_logon',
+      guaranteedBeforeLogon: false,
+      diagnostic:
+        'O Agent recupera somente apos logon da conta operacional; pre-login nao e garantido.',
+    },
+  };
+}
+
 // --------------------------------------------------------------------------
 // startMaestro — sobe tudo, retorna { stop, status, port }.
 // --------------------------------------------------------------------------
@@ -541,8 +388,6 @@ function peerState(sup) {
 export async function startMaestro(cfg, opts = {}) {
   const logDir = cfg.paths.logDir || path.join(ROOT, '.hub-logs');
   await mkdir(logDir, { recursive: true });
-  rotateLogFileSync(path.join(logDir, 'maestro.log'));
-  rotateLogFileSync(path.join(logDir, 'postgres.log'));
   const logger = opts.logger || makeLogger(path.join(logDir, 'maestro.log'));
 
   const startApp = opts.startApp !== false; // permite pular o app no smoke
@@ -550,9 +395,8 @@ export async function startMaestro(cfg, opts = {}) {
   let statusServer = null;
   let storageHandle = null;
   let updateTimer = null;
-  let activeUpdate = null;
   let stopSync = null;
-  let stopPromise = null;
+  let stopped = false;
 
   // 1. Postgres -------------------------------------------------------------
   // reusePg=true: assume um Postgres já de pé (não dá start nem stop nele).
@@ -575,7 +419,7 @@ export async function startMaestro(cfg, opts = {}) {
   } else {
     logger.info(`reusando Postgres existente :${cfg.ports.pg}`);
   }
-  await waitForPostgresReady(cfg);
+  await waitForTcp(pgTcpHost(cfg), cfg.ports.pg, 30000);
 
   // 2. bootstrap ------------------------------------------------------------
   logger.info(`bootstrap do banco "${cfg.paths.db}"`);
@@ -586,9 +430,6 @@ export async function startMaestro(cfg, opts = {}) {
   logger.info(`subindo PostgREST :${cfg.ports.postgrest}`);
   supervisors.postgrest = postgrestSupervisor(cfg, logDir).start();
   await waitForTcp('127.0.0.1', cfg.ports.postgrest, 30000);
-  // Recarrega o schema cache (cobre migrations aplicadas no bootstrap antes do
-  // PostgREST subir e qualquer estado herdado de um restart só-do-app do updater).
-  await reloadPostgrest(cfg);
 
   logger.info(`subindo GoTrue :${cfg.ports.gotrue}`);
   supervisors.gotrue = gotrueSupervisor(cfg, logDir).start();
@@ -653,12 +494,19 @@ export async function startMaestro(cfg, opts = {}) {
     // Conferimos a porta TCP de verdade — é o que diz a verdade sobre o daemon.
     const pg = peers.find((p) => p.name === 'postgres');
     if (pg) pg.running = await tcpAlive(pgTcpHost(cfg), cfg.ports.pg, 1000);
+    const agent = await buildAgentStatus(cfg.agent);
     return {
       maestro: { startedAt, manifestUrl: cfg.manifestUrl || null },
       storage: { name: 'storage', running: !!storageHandle, port: cfg.ports.storage },
       peers,
-      agent: await agentRuntimeStatus(cfg.agent),
-      sync: publicSyncStatus(!!stopSync, s),
+      agent,
+      sync: {
+        enabled: !!stopSync,
+        lastSyncOk: s.lastSyncOk,
+        pendingPush: s.pendingPush,
+        lastError: s.lastError,
+        lastSyncAt: s.lastSyncAt,
+      },
     };
   };
   statusServer = await startStatusServer(statusPort, status);
@@ -668,90 +516,62 @@ export async function startMaestro(cfg, opts = {}) {
   if (cfg.manifestUrl) {
     const intervalMs = cfg.updateIntervalMs || 3600_000;
     const restart = async () => {
-      supervisors.app = await replaceAppSupervisor(
-        supervisors.app,
-        () => appSupervisor(cfg, logDir, keys),
-      );
+      supervisors.app?.stop();
+      supervisors.app = appSupervisor(cfg, logDir, keys).start();
+    };
+    const health = async () => {
+      await waitForHttp(`http://127.0.0.1:${cfg.ports.app}/login`, 60000);
     };
     const releasesDir = cfg.paths.releasesDir || path.join(ROOT, 'releases');
     const ptrPath = cfg.paths.releasesPtr || path.join(releasesDir, 'current');
-    const health = async (expectedVersion) => {
-      const pointer = readPointerSync(ptrPath);
-      const actualVersion = currentAppVersion(pointer, cfg.version);
-      if (actualVersion !== expectedVersion) {
-        throw new Error(`health da versao ${actualVersion}; esperado ${expectedVersion}`);
-      }
-      if (pointer) resolveAppEntrypoint(ROOT, releasesDir, pointer);
-      await waitForCompleteHubStatus(
-        `http://127.0.0.1:${statusPort}/status`,
-        90000,
-      );
-    };
-    const runUpdate = () => {
-      if (activeUpdate) return activeUpdate;
-      activeUpdate = checkAndUpdate(cfg, {
+    updateTimer = setInterval(() => {
+      checkAndUpdate(cfg, {
         getCurrentVersion: () => currentAppVersion(readPointerSync(ptrPath), cfg.version),
-        preflight: async () => assertCompleteHubStatus(await status()),
         restart,
         health,
         logger,
-        migrate: async (releaseDir) => {
-          await applyPendingMigrations(cfg, cfg.paths.db, path.join(releaseDir, 'supabase', 'migrations'));
-          // CRÍTICO: o updater reinicia só o app, não o PostgREST. Sem recarregar o
-          // schema cache aqui, colunas novas da migration ficam invisíveis ao REST.
-          await reloadPostgrest(cfg);
-        },
-      })
-        .catch((e) => logger.error(`updater: ${e?.message}`))
-        .finally(() => { activeUpdate = null; });
-      return activeUpdate;
-    };
-    updateTimer = setInterval(() => {
-      void runUpdate();
+        migrate: async (releaseDir) =>
+          applyPendingMigrations(cfg, cfg.paths.db, path.join(releaseDir, 'supabase', 'migrations')),
+      }).catch((e) => logger.error(`updater: ${e?.message}`));
     }, intervalMs);
     updateTimer.unref?.();
     logger.info(`auto-update a cada ${intervalMs}ms (manifest ${cfg.manifestUrl})`);
   }
 
   // stop — ordem inversa ----------------------------------------------------
-  function stop() {
-    if (stopPromise) return stopPromise;
-    stopPromise = (async () => {
-      logger.info('parando maestro (ordem inversa)');
-      if (updateTimer) clearInterval(updateTimer);
-      if (activeUpdate) await activeUpdate;
-      if (stopSync) stopSync();
-      if (statusServer) {
-        await new Promise((resolve) => statusServer.close(resolve));
+  async function stop() {
+    if (stopped) return;
+    stopped = true;
+    logger.info('parando maestro (ordem inversa)');
+    if (updateTimer) clearInterval(updateTimer);
+    if (stopSync) stopSync();
+    await closeServerAndWait(statusServer);
+    await stopSupervisorsSequentially({
+      frontdoor: supervisors.frontdoor,
+      events: supervisors.events,
+      app: supervisors.app,
+      gateway: supervisors.gateway,
+    });
+    await closeServerAndWait(storageHandle);
+    await stopSupervisorsSequentially({
+      gotrue: supervisors.gotrue,
+      postgrest: supervisors.postgrest,
+    });
+    supervisors.postgres?.stop();
+    // Postgres: pg_ctl stop (não matamos o postmaster com kill do Supervisor).
+    // Em reusePg NÃO paramos — o cluster não é nosso.
+    if (!reusePg) {
+      try {
+        execFileSync(exe(path.join(PG_BIN, 'pg_ctl')), ['-D', cfg.paths.pgData, 'stop', '-m', 'fast'], {
+          stdio: 'ignore',
+          timeout: 20_000,
+        });
+      } catch {
+        /* já parado */
       }
-      await stopSupervisorsInOrder([
-        supervisors.frontdoor,
-        supervisors.events,
-        supervisors.app,
-        supervisors.gateway,
-      ]);
-      await storageHandle?.close();
-      await stopSupervisorsInOrder([
-        supervisors.gotrue,
-        supervisors.postgrest,
-      ]);
-      // Postgres: pg_ctl stop (não matamos o postmaster com kill do Supervisor).
-      // Em reusePg NÃO paramos — o cluster não é nosso.
-      if (!reusePg) {
-        try {
-          execFileSync(
-            exe(path.join(PG_BIN, 'pg_ctl')),
-            ['-D', cfg.paths.pgData, 'stop', '-m', 'fast'],
-            { stdio: 'ignore' },
-          );
-        } catch {
-          /* já parado */
-        }
-      }
-      logger.info?.('maestro parado');
-      await logger.close?.();
-    })();
-    return stopPromise;
+    }
+    logger.info?.('maestro parado');
+    logger.close?.();
   }
 
   return { stop, status, statusPort, supervisors };

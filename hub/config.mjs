@@ -42,13 +42,9 @@ const DEFAULTS = {
     syncIntervalMs: 10000, // EXPED_SYNC_INTERVAL_MS
   },
   agent: {
-    // Porta do listener loopback /sync-now do ExpedAgent. Zero desativa o
-    // botão e a chamada sob demanda sem desligar o ciclo automático.
     syncNowPort: 5005,
     healthPath: 'C:\\ProgramData\\ExpedAgent\\health.json',
     healthMaxAgeMs: 90000,
-    // O instalador atual executa o agente no perfil que possui acesso Windows
-    // ao SQL do Hiper. `disabled` e usado pelo pacote hub-only sem agente.
     startupMode: 'interactive_logon',
     survivesRebootWithoutLogon: false,
   },
@@ -119,13 +115,11 @@ export function loadConfig(overrides = {}) {
   if (process.env.EXPED_AGENT_SYNC_PORT !== undefined) {
     agent.syncNowPort = Number(process.env.EXPED_AGENT_SYNC_PORT);
   }
-  if (process.env.EXPED_AGENT_HEALTH_PATH) {
-    agent.healthPath = process.env.EXPED_AGENT_HEALTH_PATH;
-  }
-  if (process.env.EXPED_AGENT_HEALTH_MAX_AGE_MS !== undefined) {
+  if (process.env.EXPED_AGENT_HEALTH_PATH) agent.healthPath = process.env.EXPED_AGENT_HEALTH_PATH;
+  if (process.env.EXPED_AGENT_HEALTH_MAX_AGE_MS) {
     agent.healthMaxAgeMs = Number(process.env.EXPED_AGENT_HEALTH_MAX_AGE_MS);
   }
-  if (process.env.EXPED_AGENT_STARTUP_MODE !== undefined) {
+  if (process.env.EXPED_AGENT_STARTUP_MODE) {
     agent.startupMode = process.env.EXPED_AGENT_STARTUP_MODE;
   }
   if (process.env.EXPED_AGENT_SURVIVES_REBOOT_WITHOUT_LOGON !== undefined) {
@@ -142,14 +136,7 @@ export function loadConfig(overrides = {}) {
   const jwtSecret = resolveJwtSecret(overrides);
 
   const cfg = shallowMerge(shallowMerge(DEFAULTS, env), overrides);
-  if (
-    !Number.isInteger(cfg.agent.syncNowPort) ||
-    cfg.agent.syncNowPort < 0 ||
-    cfg.agent.syncNowPort > 65535
-  ) {
-    throw new Error('agent.syncNowPort deve ser um inteiro entre 0 e 65535');
-  }
-  if (!['interactive_logon', 'disabled'].includes(cfg.agent.startupMode)) {
+  if (cfg.agent.startupMode !== 'interactive_logon') {
     throw new Error(
       `agent.startupMode=${JSON.stringify(cfg.agent.startupMode)} recusado: ` +
       'Trusted_Connection exige a identidade interativa comprovada; windows_service nao e suportado',
@@ -159,6 +146,9 @@ export function loadConfig(overrides = {}) {
     throw new Error(
       'agent.survivesRebootWithoutLogon deve ser false: nao ha recuperacao garantida sem login',
     );
+  }
+  if (!Number.isInteger(cfg.agent.syncNowPort) || cfg.agent.syncNowPort < 0 || cfg.agent.syncNowPort > 65535) {
+    throw new Error('agent.syncNowPort deve ser um inteiro entre 0 e 65535');
   }
   if (!Number.isInteger(cfg.agent.healthMaxAgeMs) || cfg.agent.healthMaxAgeMs < 1000) {
     throw new Error('agent.healthMaxAgeMs deve ser um inteiro >= 1000');

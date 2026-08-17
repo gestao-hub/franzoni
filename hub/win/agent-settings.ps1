@@ -35,17 +35,17 @@ function Assert-ExpedInteractiveUserSid($Sid, $SettingsPath = '') {
         $localAppData = Join-Path $profilePath 'AppData\Local'
         $userShellKey = "Registry::HKEY_USERS\$Sid\Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders"
         if (Test-Path -LiteralPath $userShellKey) {
+            $userShellRegistry = $null
             try {
-                $registryKey = Get-Item -LiteralPath $userShellKey -ErrorAction Stop
-                try {
-                    $registeredLocalAppData = "$($registryKey.GetValue(
-                        'Local AppData',
-                        $null,
-                        [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames
-                    ))"
-                } finally {
-                    $registryKey.Close()
+                $userShellRegistry = (Get-Item -LiteralPath $userShellKey -ErrorAction Stop)
+                if ($null -eq $userShellRegistry) {
+                    throw "User Shell Folders ausente para SID: $Sid"
                 }
+                $registeredLocalAppData = "$($userShellRegistry.GetValue(
+                    'Local AppData',
+                    '',
+                    [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames
+                ))"
                 if ($registeredLocalAppData.StartsWith(
                     '%USERPROFILE%',
                     [System.StringComparison]::OrdinalIgnoreCase
@@ -55,6 +55,8 @@ function Assert-ExpedInteractiveUserSid($Sid, $SettingsPath = '') {
                 $localAppData = [Environment]::ExpandEnvironmentVariables($registeredLocalAppData)
             } catch {
                 throw "Nao foi possivel resolver Local AppData do SID: $Sid"
+            } finally {
+                if ($null -ne $userShellRegistry) { $userShellRegistry.Dispose() }
             }
         }
         $expectedPath = [System.IO.Path]::GetFullPath(
@@ -113,13 +115,12 @@ function Get-ExpedInstalledAgentSyncNowPort($SettingsPath) {
 function Write-ExpedJsonAtomically($Path, $Value) {
     $fullPath = [System.IO.Path]::GetFullPath($Path)
     $tempPath = "$fullPath.$PID.$([Guid]::NewGuid().ToString('N')).tmp"
-    $replaceBackupPath = "$fullPath.$PID.$([Guid]::NewGuid().ToString('N')).replace.bak"
+    $replaceBackupPath = "$fullPath.$PID.$([Guid]::NewGuid().ToString('N')).bak"
     try {
         [System.IO.File]::WriteAllText($tempPath, ($Value | ConvertTo-Json -Depth 8), $script:ExpedUtf8NoBom)
         if (Test-Path -LiteralPath $fullPath) {
             if ($script:ExpedIsWindowsPlatform) {
                 [System.IO.File]::Replace($tempPath, $fullPath, $replaceBackupPath)
-                [System.IO.File]::Delete($replaceBackupPath)
             } else {
                 [System.IO.File]::Move($tempPath, $fullPath, $true)
             }
@@ -128,9 +129,7 @@ function Write-ExpedJsonAtomically($Path, $Value) {
         }
     } finally {
         if (Test-Path -LiteralPath $tempPath) { Remove-Item -LiteralPath $tempPath -Force }
-        if (Test-Path -LiteralPath $replaceBackupPath) {
-            Remove-Item -LiteralPath $replaceBackupPath -Force
-        }
+        if (Test-Path -LiteralPath $replaceBackupPath) { Remove-Item -LiteralPath $replaceBackupPath -Force }
     }
 }
 
@@ -141,13 +140,12 @@ function Write-ExpedBytesAtomically($Path, [byte[]]$Bytes) {
         New-Item -ItemType Directory -Force -Path $parent | Out-Null
     }
     $tempPath = "$fullPath.$PID.$([Guid]::NewGuid().ToString('N')).tmp"
-    $replaceBackupPath = "$fullPath.$PID.$([Guid]::NewGuid().ToString('N')).replace.bak"
+    $replaceBackupPath = "$fullPath.$PID.$([Guid]::NewGuid().ToString('N')).bak"
     try {
         [System.IO.File]::WriteAllBytes($tempPath, $Bytes)
         if (Test-Path -LiteralPath $fullPath) {
             if ($script:ExpedIsWindowsPlatform) {
                 [System.IO.File]::Replace($tempPath, $fullPath, $replaceBackupPath)
-                [System.IO.File]::Delete($replaceBackupPath)
             } else {
                 [System.IO.File]::Move($tempPath, $fullPath, $true)
             }
@@ -156,9 +154,7 @@ function Write-ExpedBytesAtomically($Path, [byte[]]$Bytes) {
         }
     } finally {
         if (Test-Path -LiteralPath $tempPath) { Remove-Item -LiteralPath $tempPath -Force }
-        if (Test-Path -LiteralPath $replaceBackupPath) {
-            Remove-Item -LiteralPath $replaceBackupPath -Force
-        }
+        if (Test-Path -LiteralPath $replaceBackupPath) { Remove-Item -LiteralPath $replaceBackupPath -Force }
     }
 }
 
@@ -169,6 +165,9 @@ function New-ExpedFileSnapshot($Path) {
         Path = $fullPath
         Exists = $exists
         Bytes = if ($exists) { [System.IO.File]::ReadAllBytes($fullPath) } else { $null }
+        AclSddl = if ($exists -and $script:ExpedIsWindowsPlatform) {
+            (Get-Acl -LiteralPath $fullPath).Sddl
+        } else { '' }
     }
 }
 
@@ -176,6 +175,11 @@ function Restore-ExpedFileSnapshot($Snapshot) {
     if ($null -eq $Snapshot) { return }
     if ($Snapshot.Exists) {
         Write-ExpedBytesAtomically $Snapshot.Path $Snapshot.Bytes
+        if ($script:ExpedIsWindowsPlatform -and $Snapshot.AclSddl) {
+            $security = New-Object System.Security.AccessControl.FileSecurity
+            $security.SetSecurityDescriptorSddlForm("$($Snapshot.AclSddl)")
+            Set-Acl -LiteralPath $Snapshot.Path -AclObject $security
+        }
     } elseif (Test-Path -LiteralPath $Snapshot.Path) {
         Remove-Item -LiteralPath $Snapshot.Path -Force
     }
@@ -201,15 +205,6 @@ function Set-ExpedAgentSettings {
     $settings = Get-Content -Raw -LiteralPath $SettingsPath | ConvertFrom-Json
     if (-not $settings.Agent) { throw "appsettings.json do ExpedAgent sem o no Agent: $SettingsPath" }
     $settings.Agent | Add-Member -NotePropertyName SyncNowPort -NotePropertyValue $SyncNowPort -Force
-    if (-not $settings.Logging) {
-        $settings | Add-Member -NotePropertyName Logging -NotePropertyValue ([pscustomobject]@{}) -Force
-    }
-    if (-not $settings.Logging.LogLevel) {
-        $settings.Logging | Add-Member -NotePropertyName LogLevel `
-            -NotePropertyValue ([pscustomobject]@{}) -Force
-    }
-    $settings.Logging.LogLevel | Add-Member `
-        -NotePropertyName 'System.Net.Http.HttpClient' -NotePropertyValue 'Warning' -Force
     if ($UpdateCredentials) {
         if (-not $ApiBaseUrl -or -not $DeviceToken) {
             throw 'ApiBaseUrl e DeviceToken sao obrigatorios ao atualizar credenciais do agente'

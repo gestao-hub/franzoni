@@ -9,7 +9,6 @@ function validPort(value, label) {
   }
   return value;
 }
-
 function validSid(value, label = 'userSid') {
   const sid = String(value || '').trim();
   if (!/^S-\d-(?:\d+-)+\d+$/i.test(sid)) {

@@ -2,34 +2,22 @@ using ExpedAgent;
 using System.Text;
 using System.Text.Json;
 
-// O log vai pro agent.log via redirect do start.cmd, que é block-buffered → o arquivo ficava
-// "parado" e o watchdog (mtime > 15min) reiniciava o agente à toa. AutoFlush no stdout grava
-// cada linha na hora. (v1.4.3)
-Console.SetOut(new StreamWriter(Console.OpenStandardOutput()) { AutoFlush = true });
-
 var builder = Host.CreateApplicationBuilder(args);
 builder.Services.AddWindowsService(o => o.ServiceName = "ExpedAgent");
 
-// O agente pode ser iniciado por Startup ou como servico. Leia sempre o JSON ao
-// lado do executavel e mantenha env/linha de comando com precedencia.
 builder.Configuration
     .SetBasePath(AppContext.BaseDirectory)
     .AddJsonFile("appsettings.json", optional: false, reloadOnChange: true)
     .AddEnvironmentVariables();
 if (args.Length > 0) builder.Configuration.AddCommandLine(args);
 
-var agentSection = builder.Configuration.GetSection("Agent");
-var cfg = agentSection.Get<AgentConfig>() ?? new AgentConfig();
-builder.Services.Configure<AgentConfig>(agentSection);
+var cfg = builder.Configuration.GetSection("Agent").Get<AgentConfig>() ?? new AgentConfig();
 builder.Services.AddSingleton(cfg);
 builder.Services.AddSingleton(new HiperRepository(cfg.SqlConnectionString));
 builder.Services.AddSingleton(new StateStore());
-builder.Services.AddSingleton<SyncGate>();
-builder.Services.AddSingleton<SyncNowTelemetry>();
 builder.Services.AddHttpClient<IngestClient>();
 builder.Services.AddHttpClient<RemoteConfigClient>();
 builder.Services.AddHostedService<Worker>();
-builder.Services.AddHostedService<PuxarService>();
 builder.Services.AddHostedService<AgentReadinessService>();
 
 var host = builder.Build();
@@ -37,7 +25,6 @@ host.Run();
 
 public sealed class AgentReadinessService(
     HiperRepository repository,
-    SyncNowTelemetry syncNowTelemetry,
     ILogger<AgentReadinessService> log) : BackgroundService
 {
     private static readonly JsonSerializerOptions JsonOptions = new()
@@ -84,8 +71,7 @@ public sealed class AgentReadinessService(
             var snapshot = AgentReadinessSnapshot.Create(
                 Environment.ProcessId,
                 AgentInfo.Version,
-                hiper,
-                syncNowTelemetry.Last);
+                hiper);
             try
             {
                 await WriteAtomicallyAsync(HealthPath, snapshot, stoppingToken);

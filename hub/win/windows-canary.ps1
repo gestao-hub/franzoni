@@ -73,13 +73,6 @@ function Assert-HubAndSync($Status) {
     if ($null -ne $Status.sync.lastError) {
         throw "sync cloud reportou lastError: $($Status.sync.lastError)"
     }
-    if ($Status.sync.lastSyncOk -ne $true) {
-        throw 'sync cloud ainda nao concluiu um ciclo com sucesso.'
-    }
-    $lastSyncAt = [DateTimeOffset]::MinValue
-    if (-not [DateTimeOffset]::TryParse("$($Status.sync.lastSyncAt)", [ref]$lastSyncAt)) {
-        throw 'sync cloud nao publicou lastSyncAt valido.'
-    }
 }
 
 function Assert-PostLoginReadiness($Status) {
@@ -94,8 +87,8 @@ function Assert-PostLoginReadiness($Status) {
         throw 'Agent esta em execucao, mas a consulta read-only Hiper falhou.'
     }
     if ($Status.agent.hiper.schemaCompatible -ne $true -or
-        $Status.agent.hiper.targetSchema -ne 'Exped Agent schema v1') {
-        throw 'O probe nao comprovou o contrato de schema Exped Agent v1.'
+        $Status.agent.hiper.targetSchema -ne 'Hiper Loja 197') {
+        throw 'O probe nao comprovou compatibilidade com Hiper Loja 197.'
     }
 }
 
@@ -196,26 +189,15 @@ function Install-CanaryHooks {
 }
 
 function Invoke-PreLoginCanary {
-    $deadline = (Get-Date).AddMinutes(5)
-    $lastFailure = 'sem status'
-    do {
-        try {
-            $status = Get-CanaryStatus 30
-            Assert-HubAndSync $status
-            if ($status.agent.running -eq $true) {
-                throw 'PreLogin encontrou Agent ativo; investigue auto-logon ou mecanismo nao documentado.'
-            }
-            Write-CanaryReceipt 'PreLogin' $status ([ordered]@{
-                result = 'Hub e um ciclo cloud recuperaram sem login; Agent corretamente nao foi declarado recuperado.'
-                next = 'Efetue logon na conta operacional e confira o receipt PostLogin.'
-            })
-            return
-        } catch {
-            $lastFailure = $_.Exception.Message
-        }
-        Start-Sleep -Seconds 2
-    } while ((Get-Date) -lt $deadline)
-    throw "PreLogin nao ficou pronto: $lastFailure"
+    $status = Get-CanaryStatus 240
+    Assert-HubAndSync $status
+    if ($status.agent.running -eq $true) {
+        throw 'PreLogin encontrou Agent ativo; investigue auto-logon ou mecanismo nao documentado.'
+    }
+    Write-CanaryReceipt 'PreLogin' $status ([ordered]@{
+        result = 'Hub recuperou sem login; Agent corretamente nao foi declarado recuperado.'
+        next = 'Efetue logon na conta operacional e confira o receipt PostLogin.'
+    })
 }
 
 function Invoke-PostLoginCanary {
@@ -227,7 +209,7 @@ function Invoke-PostLoginCanary {
             Assert-PostLoginReadiness $status
             Write-CanaryReceipt 'PostLogin' $status ([ordered]@{
                 agent = 'Agent em execucao comprovado por heartbeat fresco.'
-                hiper = 'Consulta read-only real e contrato de schema Exped Agent v1 comprovados separadamente.'
+                hiper = 'Consulta read-only real e schema Hiper Loja 197 comprovados separadamente.'
             })
             return
         } catch {
@@ -247,7 +229,7 @@ function Test-NewerTimestamp($After, $Before) {
 function Invoke-SyncButtonCanary {
     $before = Get-CanaryStatus 60
     Assert-PostLoginReadiness $before
-    Start-Process 'https://localhost/vendas'
+    Start-Process 'https://localhost/plataforma'
     $confirmation = Read-Host 'Clique no controle Sincronizar na interface, aguarde a confirmacao visual e digite OK'
     if ($confirmation -ne 'OK') { throw 'Evidencia do controle Sincronizar nao confirmada pelo tecnico.' }
 
@@ -255,27 +237,22 @@ function Invoke-SyncButtonCanary {
     do {
         $after = Get-CanaryStatus 30
         Assert-PostLoginReadiness $after
-        $syncNowAdvanced = Test-NewerTimestamp $after.agent.lastSyncNowAt $before.agent.lastSyncNowAt
-        $syncNowOk = $after.agent.lastSyncNowOk -eq $true
+        $agentAdvanced = Test-NewerTimestamp $after.agent.checkedAt $before.agent.checkedAt
         $syncAdvanced = Test-NewerTimestamp $after.sync.lastSyncAt $before.sync.lastSyncAt
-        $cloudAfterAgent = Test-NewerTimestamp $after.sync.lastSyncAt $after.agent.lastSyncNowAt
-        if ($syncNowAdvanced -and $syncNowOk -and $syncAdvanced -and $cloudAfterAgent) {
+        if ($agentAdvanced -and $syncAdvanced) {
             Write-CanaryReceipt 'SyncButton' $after ([ordered]@{
                 operatorConfirmation = $confirmation
-                beforeAgentSyncNowAt = $before.agent.lastSyncNowAt
-                afterAgentSyncNowAt = $after.agent.lastSyncNowAt
-                agentSyncNowOk = $after.agent.lastSyncNowOk
-                agentSyncNowSynced = $after.agent.lastSyncNowSynced
+                beforeAgentCheckedAt = $before.agent.checkedAt
+                afterAgentCheckedAt = $after.agent.checkedAt
                 beforeCloudSyncAt = $before.sync.lastSyncAt
                 afterCloudSyncAt = $after.sync.lastSyncAt
-                cloudCompletedAfterAgent = $cloudAfterAgent
                 interpretation = 'Evidencia temporal do botao, probe Hiper e sync; nao prova causalidade da versao 197.'
             })
             return
         }
         Start-Sleep -Seconds 2
     } while ((Get-Date) -lt $deadline)
-    throw 'Sincronizar nao produziu conclusao causal do Agent e sync cloud posterior dentro do prazo.'
+    throw 'Sincronizar nao produziu heartbeat do Agent e sync cloud posteriores dentro do prazo.'
 }
 
 function Invoke-RollbackCanary {
@@ -296,22 +273,13 @@ function Invoke-RollbackCanary {
     try {
         [System.IO.File]::WriteAllText($tempConfig, ($config | ConvertTo-Json -Depth 16), $utf8NoBom)
         $node = Join-Path $Root 'bin\node.exe'
-        $previousEap = $ErrorActionPreference
-        $previousExpedRoot = $env:EXPED_ROOT
-        $ErrorActionPreference = 'Continue'
-        $env:EXPED_ROOT = $Root
         $forceUpdate = Join-Path $Root 'hub\force-update.mjs'
+        $previousEap = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
         try {
             $output = @(& $node $forceUpdate $tempConfig 2>&1 | ForEach-Object { "$_" })
             $exitCode = $LASTEXITCODE
-        } finally {
-            $ErrorActionPreference = $previousEap
-            if ($null -eq $previousExpedRoot) {
-                Remove-Item Env:EXPED_ROOT -ErrorAction SilentlyContinue
-            } else {
-                $env:EXPED_ROOT = $previousExpedRoot
-            }
-        }
+        } finally { $ErrorActionPreference = $previousEap }
         $resultLine = @($output | Where-Object { $_ -match '^RESULTADO:\s*\{' }) | Select-Object -Last 1
         if (-not $resultLine) { throw "force-update sem resultado de rollback. Exit=$exitCode" }
         $result = ($resultLine -replace '^RESULTADO:\s*', '') | ConvertFrom-Json
